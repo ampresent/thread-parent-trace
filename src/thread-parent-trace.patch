@@ -1,0 +1,55 @@
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -3590,6 +3590,45 @@
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_THREAD_PARENT_TRACE
++/*
++ * thread_parent_trace — 在线程创建时记录 parent → child 关系
++ * 通过 kpatch 热加载，无需重启内核
++ */
++struct tpt_entry {
++	pid_t child_pid;
++	pid_t parent_pid;
++	char  parent_comm[TASK_COMM_LEN];
++	u64   ts_ns;
++};
++
++#define TPT_MAX_ENTRIES 65536
++static DEFINE_HAShtable(tpt_hash, 10);
++static DEFINE_SPINLOCK(tpt_lock);
++
++static void tpt_record(struct task_struct *child)
++{
++	struct task_struct *parent;
++	unsigned long flags;
++
++	rcu_read_lock();
++	parent = rcu_dereference(child->real_parent);
++	if (parent) {
++		spin_lock_irqsave(&tpt_lock, flags);
++		/* 记录 child→parent 映射 */
++		pr_debug("tpt: child %d (%s) <- parent %d (%s)\n",
++			 task_pid_vnr(child), child->comm,
++			 task_pid_vnr(parent), parent->comm);
++		spin_unlock_irqrestore(&tpt_lock, flags);
++	}
++	rcu_read_unlock();
++}
++#else
++static inline void tpt_record(struct task_struct *child) {}
++#endif
++
+ /**
+  * wake_up_new_task - wake up a newly created task for the first time.
+  *
+@@ -3606,6 +3645,8 @@
+ 
+ 	__set_task_cpu(p, select_task_rq(p, task_cpu(p), SD_BALANCE_FORK, 0));
+ 
++	tpt_record(p);  /* Thread Parent Trace hook */
++
+ 	rq = __task_rq_lock(p, &rf);
+ 	update_rq_clock(rq);
+ 
