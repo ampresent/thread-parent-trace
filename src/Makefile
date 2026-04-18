@@ -68,4 +68,14 @@ utop-verify:
 utop-install:
 	utop install linux
 
-.PHONY: all clean install-mod uninstall-mod kpatch-build kpatch-install kpatch-uninstall utop-build utop-verify utop-install
+# ──────────────────────────────────────────────────
+# 用户空间测试工具：线程绑核
+# ──────────────────────────────────────────────────
+bind_children: bind_children.c
+	$(CC) -O2 -pthread -o $@ $<
+
+test-bind: bind_children
+	@echo "=== 演示：创建子线程并绑核到 CPU 0,1 ==="
+	./bind_children demo 0,1
+
+.PHONY: all clean install-mod uninstall-mod kpatch-build kpatch-install kpatch-uninstall utop-build utop-verify utop-install bind_children test-bind
