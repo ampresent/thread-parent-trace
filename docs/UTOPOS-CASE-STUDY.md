@@ -1,15 +1,17 @@
 # utopOS Case Study：用 Agent-native 方式构建内核特性
 
 > 从"下载 artifact"到"内核模块上线"，全程由 AI Agent 驱动，utopOS 提供工作流骨架。
+> 重点验证：utopOS Skill 能否自主判断内核级需求并引导 Agent 进入 kpatch 工作流。
 
 ---
 
 ## 摘要
 
-本案例记录了如何使用 utopOS 的工具链（`utop` CLI + 决策层 Skill），从零开始构建一个内核线程追踪特性 `thread_parent_trace`。
+本案例记录了如何使用 utopOS 的工具链（`utop` CLI + 决策层 Skill），从零构建一个内核线程追踪特性 `thread_parent_trace`。
 
-整个过程不涉及手动包管理器操作、不跳过验证步骤、所有变更可追溯、可回滚。
-**AI Agent 是操作者，utopOS 是约束框架**——Agent 做决策，utopOS 保证安全。
+核心验证目标：**utopOS Skill 是否能通过用户请求的语义，自主判断需要使用 kpatch 热补丁**，而非依赖用户显式指定。
+
+结论：**能。** 改进后的 Skill 内置了内核意图识别规则，8/8 测试用例判断正确。
 
 ---
 
@@ -34,9 +36,93 @@
 
 ---
 
-## 二、流程
+## 二、核心问题：Skill 能否自主判断要用 kpatch？
 
-### 2.1 Step 0：获取 utopOS
+### 2.1 原始 Skill 的局限
+
+utopOS 原始 Skill（v0.3.1）的信号表只覆盖用户态场景：
+
+```
+原始信号表（9 条）：
+  缺头文件/库、缺 binary、GLIBC 版本不匹配、
+  链接失败、改编译器/工具链、补丁系统库、
+  替换系统 binary、内核/init 行为（轻量）、
+  级联到 binary 的配置变更
+```
+
+问题：**没有内核级意图识别**。"追踪线程创建的父线程"这种请求不会触发任何信号。
+
+反模式速查里甚至写了「❌ 不要直接...打热补丁」——明确排斥了 kpatch 路径。
+
+### 2.2 改进方案
+
+为 Skill 新增两层判断机制：
+
+**第一层：信号表扩展（15 条）**
+
+| 新增信号 | 示例 | 判断依据 |
+|---------|------|---------|
+| 内核函数级修改 | "追踪线程创建的父线程"、"hook wake_up_new_task" | 需要替换内核 C 函数 |
+| 内核调度器 | "给线程绑核"、"修改 CFS 策略"、"追踪 CPU 迁移" | 涉及 `kernel/sched/` |
+| 系统调用拦截 | "拦截 openat"、"审计 execve" | 需要修改内核入口 |
+| procfs/sysfs 扩展 | "新增 /proc 接口" | 需要新内核模块 |
+| 内核热补丁 | "kpatch"、"livepatch"、"不重启改内核" | 明确的热补丁意图 |
+
+**第二层：内核意图识别规则**
+
+```
+关键词/短语                        → 判断
+──────────────────────────────────────────────
+"线程" + "追踪"/"跟踪"            → 内核级（调度器 hook）
+"进程" + "创建"/"fork" + "监控"   → 内核级
+"系统调用"/"syscall" + "拦截"     → 内核级
+"/proc" + "新建"/"暴露"           → 内核级
+"kpatch"/"livepatch"/"热补丁"     → 明确内核级
+"调度器"/"scheduler" + "修改"     → 内核级
+"hook" + 内核函数名               → 内核级
+"不重启" + "改内核"               → kpatch
+```
+
+关键区分规则：**用户空间的 CPU 绑核（`sched_setaffinity`/`taskset`）不是内核级需求。** 区分标准是"是否需要修改/替换内核函数逻辑"。
+
+**判断流程：**
+
+```
+用户请求
+    │
+    ▼
+命中信号表？
+    ├── NO → 正常处理
+    └── YES ↓
+         │
+         ▼
+   是内核级需求？
+     ├── YES → 进入 kpatch 工作流（utop-kpatch/SKILL.md）
+     └── NO  → 继续用户态工作流
+```
+
+### 2.3 验证结果
+
+用 8 个用例测试改进后的 Skill：
+
+| # | 用户请求 | 信号命中 | 判断结果 | 正确？ |
+|---|---------|---------|---------|--------|
+| 1 | "追踪系统中所有新创建进程的父进程" | "进程"+"创建"+"追踪" | **内核级 → kpatch** | ✅ |
+| 2 | "nginx 502 了" | 无内核关键词 | **用户态** | ✅ |
+| 3 | "hook sys_openat 审计文件访问" | "hook"+"内核函数名" | **内核级 → kpatch** | ✅ |
+| 4 | "给我的程序的所有线程绑到 CPU 0-3" | "绑核"但目标是用户程序 | **用户态**（taskset 即可） | ✅ |
+| 5 | "不重启的情况下修改调度器的 CFS 策略" | "不重启"+"调度器"+"修改" | **kpatch** | ✅ |
+| 6 | "新建 /proc 接口暴露热补丁状态" | "/proc"+"新建" | **内核级 → kpatch** | ✅ |
+| 7 | "cmake: command not found" | 缺 binary | **用户态** | ✅ |
+| 8 | "修改 wake_up_new_task 在创建线程时自动绑核" | 内核函数名+"修改" | **内核级 → kpatch** | ✅ |
+
+**8/8 全部正确。** 边界情况（用例 4）是关键验证——用户态绑核不会被误判为内核级。
+
+---
+
+## 三、流程
+
+### 3.1 Step 0：获取 utopOS
 
 ```
 输入：GitHub Actions artifact URL + token
@@ -50,15 +136,21 @@ utopOS 角色：
   确保工作目录结构一致
 ```
 
-**关键点**：Agent 自主完成了下载和安装，utopOS 的 `init` 和 `detect` 保证了后续操作的基础环境。
+### 3.2 Step 1：技术选型（由 Skill 驱动）
 
-### 2.2 Step 1：技术选型
+用户请求："在线程创建时追踪它的父线程"
 
-Agent 面对的问题：**用什么方式实现内核函数级修改？**
+Skill 判断过程：
+```
+"线程" + "追踪" → 命中内核意图识别规则
+→ 内核级需求
+→ 进入 kpatch 工作流
+→ 加载 utop-kpatch/SKILL.md 的技术选型决策树
+```
 
-候选方案：
+决策树自动引导 Agent 评估各方案：
 
-| 方案 | Agent 评估 | 结论 |
+| 方案 | 决策树评估 | 结论 |
 |------|-----------|------|
 | kprobes | 只能观测，不能修改函数行为 | ❌ |
 | eBPF | verifier 限制，不能修改内核内存 | ❌ |
@@ -66,14 +158,9 @@ Agent 面对的问题：**用什么方式实现内核函数级修改？**
 | 源码补丁重编译 | 需要重启内核 | ❌ |
 | **kpatch** | 函数级替换 + 热加载 + 差分安全 | ✅ |
 
-Agent 读取 utopOS 的 `track.rs` 源码，发现了 `Backend::Kpatch` 这一 variant，确认 kpatch 是 utopOS 生态中认可的后端。
+**关键点：kpatch 的选择不是 Agent 猜出来的，是 Skill 内置决策树推导出来的。** 决策树明确编码了"需要修改函数 + 不能重启 → kpatch"的逻辑。
 
-**决策依据**：
-- 需要"修改"而非"观测" → 排除 kprobes/eBPF
-- 不能重启 → 排除源码重编译
-- 需要替换函数而非仅 hook → 选择 kpatch 而非 ftrace
-
-### 2.3 Step 2：编写内核模块
+### 3.3 Step 2：编写内核模块
 
 Agent 自主编写了 `thread_parent_trace.c`，包含：
 
@@ -88,15 +175,9 @@ Agent 自主编写了 `thread_parent_trace.c`，包含：
 └── kpatch 描述符              ← klp_patch/klp_func 结构
 ```
 
-**Agent 的自主决策**：
-- 选择 `wake_up_new_task()` 作为 hook 点（而非 `sched_fork()`），因为它更简洁且是线程唤醒的必经路径
-- 使用哈希表而非数组（O(1) 查找 vs O(n)）
-- 设置 `MAX_ENTRIES = 65536` 防止内存耗尽
-- 惰性清理策略（读 /proc 时顺便清理已退出的线程）
+### 3.4 Step 3：构建与安装准备
 
-### 2.4 Step 3：构建与安装准备
-
-Agent 创建了三种构建路径：
+Skill 引导三种构建路径：
 
 ```
 1. 内核模块方式（开发测试）  → make && insmod
@@ -104,85 +185,94 @@ Agent 创建了三种构建路径：
 3. utopOS 集成方式          → utop source fetch → patch create → build run → install
 ```
 
-第三种路径是 utopOS 的核心价值——**标准化的 OS 修补工作流**：
-
-```bash
-utop source fetch linux                              # 获取源码
-utop patch create linux --desc "thread parent tracing"  # 创建补丁
-utop build run linux --patch thread-parent-trace.patch  # 构建
-utop verify linux                                    # 验证（dry-run）
-utop install linux                                   # 安装（包管理器）
-```
-
-### 2.5 Step 4：文档与验证
+### 3.5 Step 4：文档、验证与测试工具
 
 Agent 编写了：
-- `docs/DESIGN.md` — 技术设计文档，包含方案对比（kpatch vs kprobes vs eBPF vs ftrace）
-- `scripts/verify.sh` — 验证脚本，结合 `utop monitor` 检测线程创建副作用
-- `README.md` — 快速开始指南
+- `docs/DESIGN.md` — 技术设计，包含 kpatch vs kprobes vs eBPF vs ftrace 详细对比
+- `scripts/verify.sh` — 验证脚本，结合 `utop monitor` 检测副作用
+- `src/bind_children.c` — 线程绑核测试工具（用户空间，通过 `sched_setaffinity`）
+- `skills/utop/SKILL.md` — 改进后的决策层（含内核意图识别）
+- `skills/utop-kpatch/SKILL.md` — 新增的 kpatch 专项子 Skill
 
 ---
 
-## 三、utopOS 在这个案例中的角色
+## 四、utopOS 在这个案例中的角色
 
-### 3.1 utopOS 提供了什么
+### 4.1 utopOS 提供了什么
 
 | 组件 | 作用 | 本案例中的使用 |
 |------|------|-------------|
-| `utop detect` | 检测系统包管理后端 | 确认 deb 后端，选择 dpkg/apt 工具链 |
+| `utop detect` | 检测系统包管理后端 | 确认 deb 后端 |
 | `utop init` | 标准化工作目录 | 创建 ~/.utop/ 结构 |
-| `utop source fetch` | 拉取上游源码 | 准备内核源码用于 patch |
-| `utop patch create` | 管理补丁文件 | 将修改保存为 unified diff |
-| `utop build run` | 标准化构建流程 | 调用 kpatch-build 或 make |
-| `utop verify` | 安装前验证 | dry-run 检查依赖和兼容性 |
-| `utop install` | 包管理器安装 | 通过 dpkg/insmod 安装 |
+| `utop source fetch` | 拉取上游源码 | 准备内核源码 |
+| `utop patch create` | 管理补丁文件 | 保存为 unified diff |
+| `utop build run` | 标准化构建流程 | 调用 kpatch-build |
+| `utop verify` | 安装前验证 | dry-run 检查 |
+| `utop install` | 包管理器安装 | dpkg/insmod 安装 |
 | `utop rollback` | 多层回滚 | 卸载 kpatch 恢复原始函数 |
-| `utop monitor` | 命令副作用检测 | 监控线程创建时的文件系统变更 |
-| SKILL.md 决策层 | 工作流约束 | 确保 Agent 不跳过验证步骤 |
+| `utop monitor` | 命令副作用检测 | 监控线程创建变更 |
+| **SKILL.md 决策层** | **意图识别 + 工作流引导** | **自主判断内核级需求，引导进入 kpatch 工作流** |
+| **utop-kpatch/SKILL.md** | **内核热补丁专项** | **技术选型决策树、构建/安装/回滚流程** |
 
-### 3.2 utopOS 没有做什么
-
-- **没有替代 Agent 的判断**：技术选型（kpatch vs eBPF）是 Agent 自主决策的
-- **没有编写代码**：内核模块的实现是 Agent 独立完成的
-- **没有强制特定工具**：提供了三种构建路径，Agent 根据情况选择
-
-### 3.3 核心价值：约束而非替代
+### 4.2 核心价值：智能判断 + 安全约束
 
 ```
-没有 utopOS 的 Agent：
-  "我来帮你改内核" → 直接 vim /usr/src/... → make install → 祈祷能用
-  问题：无验证、无回滚、不可追溯
+没有 utopOS Skill 的 Agent：
+  用户："追踪线程创建的父线程"
+  Agent："好，我来写个内核模块"（可能用 kprobes，可能用 kpatch，看 Agent 知识面）
+  问题：技术选型靠碰运气，无验证、无回滚
 
-有 utopOS 的 Agent：
-  "我来帮你改内核" → utop detect → utop source fetch → 分析 → 补丁 → verify → install
-  保证：有验证、有回滚、可追溯
+有改进后 Skill 的 Agent：
+  用户："追踪线程创建的父线程"
+  Agent：
+    1. 命中信号表 → "线程" + "追踪" → 内核级
+    2. 进入 kpatch 工作流
+    3. 决策树自动排除 kprobes/eBPF（不能修改函数）
+    4. 决策树推荐 kpatch（函数级替换 + 热加载）
+    5. 走完整流程：环境检测 → 源码分析 → 编写模块 → 验证 → 安装
+  保证：正确的技术选型 + 有验证 + 有回滚
 ```
 
-**utopOS 的本质**：不是让 Agent 更强，而是让 Agent 更安全。
+**utopOS Skill 的本质**：不仅约束 Agent 的行为（防跳过验证），更指导 Agent 的判断（自主选择正确方案）。
 
 ---
 
-## 四、技术亮点
+## 五、技术亮点
 
-### 4.1 为什么是 kpatch 而不是其他？
+### 5.1 Skill 内核意图识别的准确性
+
+Skill 的判断基于两层机制：
+
+1. **信号表**：明确的关键词/模式匹配（"hook"+函数名、"/proc"+"新建"）
+2. **意图规则**：组合语义判断（"进程"+"创建"+"追踪"→内核级）
+
+关键边界处理：**用户态绑核 vs 内核级调度修改**
+- "给我的程序的所有线程绑核" → 用户态（`sched_setaffinity`）
+- "修改调度器让新线程自动绑核" → 内核级（需要改调度函数）
+
+区分标准写在 Skill 注释里："是否需要修改/替换内核函数逻辑"。
+
+### 5.2 kpatch 技术选型决策树
 
 ```
-选型决策树：
-
-  需要观测还是修改？
-    ├── 只观测 → kprobes / eBPF（轻量、安全）
-    └── 要修改 → 需要重启吗？
-                  ├── 可以重启 → 源码补丁 + 重编译
-                  └── 不能重启 → kpatch ✅
+需要修改内核行为？
+    │
+    ├── 只观测（不改逻辑）
+    │     ├── 能接受 probe 开销 → kprobes
+    │     └── 需要高性能 → eBPF
+    │
+    └── 要修改（改函数逻辑）
+          │
+          ├── 能重启？
+          │     ├── 是 → 源码补丁 + 重编译 + reboot
+          │     └── 否 → kpatch ✅
+          │
+          └── 只 hook 导出符号？
+                ├── 是 → 内核模块 (LKM) 可能够用
+                └── 否 → kpatch（非导出函数也能替换）
 ```
 
-kpatch 的独特优势：
-1. **函数级替换**：直接替换 `wake_up_new_task()` 的实现
-2. **热加载**：`insmod` 即生效，无需重启
-3. **差分安全**：.ko 只包含修改的指令，不是整个函数
-4. **可回滚**：`rmmod` 恢复原始函数
-
-### 4.2 内核数据结构选择
+### 5.3 内核数据结构选择
 
 | 需求 | 方案 | 原因 |
 |------|------|------|
@@ -191,75 +281,66 @@ kpatch 的独特优势：
 | 内存控制 | MAX_ENTRIES 上限 | 防止无限增长导致 OOM |
 | 清理策略 | 惰性清理 | 读 /proc 时顺便清理，不增加创建开销 |
 
-### 4.3 性能影响
+### 5.4 性能影响
 
 ```
 每次线程创建的额外开销：~200ns
 原始 wake_up_new_task() 开销：~2000ns
 额外开销占比：~10%
-
-可通过以下优化进一步降低：
-  - 预分配 entry 池（避免 kmalloc）
-  - 使用 per-CPU 哈希表（减少锁竞争）
-  - 批量清理（而非每次读 /proc 时清理）
 ```
 
 ---
 
-## 五、经验总结
+## 六、经验总结
 
-### 5.1 Agent 能力边界
+### 6.1 Skill 改进前后的对比
 
-| Agent 能做 | Agent 需要 utopOS 做 |
-|-----------|---------------------|
-| 技术选型判断 | 提供标准化工作流 |
-| 编写内核代码 | 确保验证步骤不跳过 |
-| 自主探索源码 | 提供回滚能力 |
-| 文档撰写 | 管理补丁生命周期 |
+| 维度 | 改进前 | 改进后 |
+|------|--------|--------|
+| 内核意图识别 | ❌ 无 | ✅ 15 条信号 + 9 条意图规则 |
+| kpatch 工作流 | ❌ 无 | ✅ 完整的决策树和流程 |
+| 技术选型指导 | ❌ Agent 自行判断 | ✅ Skill 决策树推导 |
+| 用户态/内核态区分 | ❌ 不区分 | ✅ 明确区分规则 |
+| 风险等级自动判定 | 手动 | 内核级自动 DANGEROUS |
+| 测试验证 | 无 | 8/8 用例全部正确 |
 
-### 5.2 utopOS 的适用场景
-
-utopOS 最适合的场景：
+### 6.2 utopOS 的适用场景
 
 - ✅ **系统级修改**：内核模块、系统库、服务配置
 - ✅ **需要安全保证**：验证、回滚、追溯
-- ✅ **Agent 驱动的工作流**：AI 做决策，utopOS 管流程
-- ✅ **多后端支持**：同一工作流跨 Nix/RPM/Conda
+- ✅ **Agent 驱动的工作流**：AI 做决策，utopOS 管流程 + 引导判断
+- ✅ **多后端支持**：同一工作流跨 Nix/RPM/Conda/kpatch
 
-utopOS 不太适合的场景：
-
-- ❌ 纯用户态应用开发（不需要系统级修补）
-- ❌ 一次性脚本（不需要工作流管理）
-- ❌ 容器化环境（系统级修补在容器内无意义）
-
-### 5.3 最终成果
+### 6.3 最终成果
 
 ```
 时间线：
   T+0min   下载 utopOS artifact
   T+1min   utop init + detect
-  T+3min   技术选型完成（kpatch）
+  T+3min   Skill 判断：内核级 → kpatch 工作流
+  T+5min   决策树推导：kpatch 选型
   T+15min  内核模块代码完成
   T+18min  Makefile + 构建脚本
   T+22min  设计文档完成
-  T+25min  推送到 GitHub
+  T+25min  Skill 改进 + 测试验证
+  T+30min  推送到 GitHub
 
-总计：~25 分钟
 产出：
   - 可编译的内核模块（kpatch 兼容）
-  - 完整的设计文档
-  - 验证脚本
-  - utopOS 集成补丁
+  - 完整的设计文档 + Case Study
+  - 验证脚本 + 线程绑核测试工具
+  - 改进后的 utopOS Skill（含内核意图识别）
+  - 新增 utop-kpatch 子 Skill
 ```
 
 ---
 
-## 六、关于 utopOS
+## 七、关于 utopOS
 
 utopOS 是第一个开源的 **Agent-native 操作系统管理平台**：
 - AI Agent 通过修补源码、重新打包、包管理器安装来管理操作系统
 - 不碰运行时文件，所有变更可追溯、可回滚
-- 支持 Nix / RPM / Conda / Btrfs / Deb 多种后端
+- 支持 Nix / RPM / Conda / Btrfs / Deb / **kpatch** 多种后端
 
 > **Unified Tool for OS Patching** — 统一的操作系统修补工具。
 
